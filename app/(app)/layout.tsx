@@ -19,6 +19,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
           <nav className="flex items-center gap-6 text-sm">
             <Link href="/dashboard">Cases</Link>
             <Link href="/properties">Properties</Link>
+            <Link href="/renters">Renters</Link>
             <Link href="/attorneys">Attorneys</Link>
             <span className="text-muted-foreground">{user.email}</span>
             <SignOutButton />
