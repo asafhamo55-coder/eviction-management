@@ -8,6 +8,9 @@ export default async function DashboardLayout({ children }: { children: React.Re
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) redirect("/login");
 
+  // First-visit bootstrap: idempotently create EMS org + profile.
+  await supabase.rpc("ensure_profile", { p_org_name: null });
+
   return (
     <div className="min-h-screen">
       <header className="border-b">

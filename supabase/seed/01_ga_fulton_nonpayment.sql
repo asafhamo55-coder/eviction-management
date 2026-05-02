@@ -1,14 +1,14 @@
 -- Seed: Georgia / Fulton County / Non-Payment grounds
 -- Sources cited inline. Always verify against current OCGA before relying.
 
-insert into public.jurisdiction_rules (
+insert into eviction_management.jurisdiction_rules (
   jurisdiction_code, rule_type, grounds, tenancy_types, payload,
   statute_citation, source_url, verified_by, verified_at
 ) values
 -- Demand for possession (no statutory waiting period; "immediately")
 ('US-GA', 'NOTICE_PERIOD',
- array['NON_PAYMENT']::grounds[],
- array['WRITTEN_LEASE','M2M']::tenancy_type[],
+ array['NON_PAYMENT']::eviction_management.grounds[],
+ array['WRITTEN_LEASE','M2M']::eviction_management.tenancy_type[],
  jsonb_build_object(
    'duration_days', 0,
    'exclude_weekends', false,
@@ -24,8 +24,8 @@ insert into public.jurisdiction_rules (
 
 -- Tenant answer period: 7 days from service of summons
 ('US-GA', 'ANSWER_PERIOD',
- array['NON_PAYMENT']::grounds[],
- array['WRITTEN_LEASE','M2M']::tenancy_type[],
+ array['NON_PAYMENT']::eviction_management.grounds[],
+ array['WRITTEN_LEASE','M2M']::eviction_management.tenancy_type[],
  jsonb_build_object(
    'duration_days', 7,
    'exclude_weekends', false,
@@ -37,8 +37,8 @@ insert into public.jurisdiction_rules (
 
 -- Court venue: Magistrate Court of the county where the property sits
 ('US-GA-FULTON', 'COURT_VENUE',
- array['NON_PAYMENT']::grounds[],
- array['WRITTEN_LEASE','M2M']::tenancy_type[],
+ array['NON_PAYMENT']::eviction_management.grounds[],
+ array['WRITTEN_LEASE','M2M']::eviction_management.tenancy_type[],
  jsonb_build_object(
    'court_name', 'Magistrate Court of Fulton County',
    'court_address', '185 Central Ave SW, Atlanta, GA 30303',
@@ -51,8 +51,8 @@ insert into public.jurisdiction_rules (
 
 -- Filing fee for dispossessory in Fulton (verify each year — fees drift)
 ('US-GA-FULTON', 'FEE',
- array['NON_PAYMENT']::grounds[],
- array['WRITTEN_LEASE','M2M']::tenancy_type[],
+ array['NON_PAYMENT']::eviction_management.grounds[],
+ array['WRITTEN_LEASE','M2M']::eviction_management.tenancy_type[],
  jsonb_build_object(
    'fee_type', 'FILING_DISPOSSESSORY',
    'fee_cents', 8000,
@@ -65,8 +65,8 @@ insert into public.jurisdiction_rules (
 
 -- Service: tacking + mailing permitted under OCGA § 44-7-51 if personal fails
 ('US-GA', 'SERVICE_METHOD',
- array['NON_PAYMENT']::grounds[],
- array['WRITTEN_LEASE','M2M']::tenancy_type[],
+ array['NON_PAYMENT']::eviction_management.grounds[],
+ array['WRITTEN_LEASE','M2M']::eviction_management.tenancy_type[],
  jsonb_build_object(
    'allowed_methods', array['PERSONAL','POST_AND_MAIL'],
    'tack_and_mail_permitted', true,
@@ -78,8 +78,8 @@ insert into public.jurisdiction_rules (
 
 -- Writ of possession: 7-day waiting period after judgment before writ executes
 ('US-GA', 'WRIT_WAIT',
- array['NON_PAYMENT']::grounds[],
- array['WRITTEN_LEASE','M2M']::tenancy_type[],
+ array['NON_PAYMENT']::eviction_management.grounds[],
+ array['WRITTEN_LEASE','M2M']::eviction_management.tenancy_type[],
  jsonb_build_object(
    'duration_days', 7,
    'starts_from', 'JUDGMENT_FOR_LANDLORD'
@@ -89,7 +89,7 @@ insert into public.jurisdiction_rules (
  'seed', now());
 
 -- Form template: Georgia Demand for Possession (Non-Payment)
-insert into public.form_templates (
+insert into eviction_management.form_templates (
   jurisdiction_code, type, version, fields_schema, body,
   attorney_signoff, signoff_at, effective_from
 ) values (

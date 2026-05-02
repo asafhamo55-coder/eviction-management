@@ -1,15 +1,24 @@
--- Eviction Management System — initial schema
--- Domain model from spec §7. RLS enforces multi-tenant isolation by org_id.
+-- Eviction Management System — initial schema (isolated in `eviction_management` schema)
+--
+-- This migration is designed to coexist with HOA and Property Management
+-- modules already living in `public`. It does NOT touch `public` at all.
+-- All EMS objects live in the `eviction_management` schema.
 
 create extension if not exists "pgcrypto";
 create extension if not exists "pg_trgm";
 
+create schema if not exists eviction_management;
+grant usage on schema eviction_management to anon, authenticated, service_role;
+alter default privileges in schema eviction_management grant all on tables    to anon, authenticated, service_role;
+alter default privileges in schema eviction_management grant all on functions to anon, authenticated, service_role;
+alter default privileges in schema eviction_management grant all on sequences to anon, authenticated, service_role;
+
 -- =====================================================================
--- Enums
+-- Enums (namespaced inside eviction_management)
 -- =====================================================================
-create type org_plan as enum ('free', 'per_case', 'pro');
-create type user_role as enum ('owner', 'manager', 'viewer');
-create type case_status as enum (
+create type eviction_management.org_plan as enum ('free', 'per_case', 'pro');
+create type eviction_management.user_role as enum ('owner', 'manager', 'viewer');
+create type eviction_management.case_status as enum (
   'DRAFT','INTAKE_COMPLETE','NOTICE_REQUIRED','NOTICE_SERVED','CURE_PERIOD',
   'TENANT_CURED','TENANT_VACATED','CURE_EXPIRED','FILING_REQUIRED','FILED',
   'SUMMONS_ISSUED','SERVICE_REQUIRED','SERVED','SERVICE_FAILED',
@@ -20,96 +29,115 @@ create type case_status as enum (
   'POST_EVICTION','CLOSED_RESOLVED','CLOSED_WRITTEN_OFF',
   'ATTORNEY_REQUIRED','ATTORNEY_ENGAGED'
 );
-create type grounds as enum (
+create type eviction_management.grounds as enum (
   'NON_PAYMENT','LEASE_VIOLATION_CURABLE','LEASE_VIOLATION_NON_CURABLE',
   'HOLDOVER','NUISANCE_ILLEGAL','NO_CAUSE'
 );
-create type tenancy_type as enum (
+create type eviction_management.tenancy_type as enum (
   'WRITTEN_LEASE','ORAL_LEASE','M2M','WEEK_TO_WEEK','AT_WILL',
   'SUBSIDIZED','MOBILE_HOME_PARK'
 );
-create type property_type as enum ('SFR','CONDO','SMALL_MULTI','LARGE_MULTI');
-create type rule_type as enum (
+create type eviction_management.property_type as enum ('SFR','CONDO','SMALL_MULTI','LARGE_MULTI');
+create type eviction_management.rule_type as enum (
   'NOTICE_PERIOD','FILING_FORM','COURT_VENUE','FEE','SERVICE_METHOD',
   'WRIT_WAIT','RELOCATION_ASSIST','ALLOWED_GROUNDS_OVERLAY','ANSWER_PERIOD'
 );
-create type service_method as enum (
+create type eviction_management.service_method as enum (
   'PERSONAL','SUBSTITUTE_AND_MAIL','POST_AND_MAIL','CERTIFIED_MAIL','EMAIL'
 );
-create type document_type as enum (
+create type eviction_management.document_type as enum (
   'NOTICE','COMPLAINT','SUMMONS','AFFIDAVIT_OF_SERVICE','JUDGMENT',
   'WRIT_OF_POSSESSION','SETTLEMENT','ENGAGEMENT_LETTER','OTHER'
 );
-create type case_event_actor as enum ('LANDLORD','TENANT','SYSTEM','ATTORNEY','COURT');
-create type comm_channel as enum ('EMAIL','SMS','PORTAL','MAIL','IN_PERSON');
-create type comm_direction as enum ('INBOUND','OUTBOUND');
+create type eviction_management.case_event_actor as enum ('LANDLORD','TENANT','SYSTEM','ATTORNEY','COURT');
+create type eviction_management.comm_channel as enum ('EMAIL','SMS','PORTAL','MAIL','IN_PERSON');
+create type eviction_management.comm_direction as enum ('INBOUND','OUTBOUND');
 
 -- =====================================================================
 -- Helpers
 -- =====================================================================
-create or replace function public.touch_updated_at() returns trigger
+create or replace function eviction_management.touch_updated_at() returns trigger
 language plpgsql as $$
 begin new.updated_at = now(); return new; end $$;
 
 -- =====================================================================
--- Organizations & users
+-- Organizations & profiles
+-- EMS keeps its own org/profile records so it works fully standalone.
+-- A user signed in via Supabase Auth gets an EMS org + profile created
+-- on first visit by calling eviction_management.ensure_profile().
 -- =====================================================================
-create table public.organizations (
+create table eviction_management.organizations (
   id          uuid primary key default gen_random_uuid(),
   name        text not null,
-  plan        org_plan not null default 'free',
+  plan        eviction_management.org_plan not null default 'free',
   billing_customer_id text,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
-create trigger trg_orgs_updated before update on public.organizations
-  for each row execute function public.touch_updated_at();
+create trigger trg_orgs_updated before update on eviction_management.organizations
+  for each row execute function eviction_management.touch_updated_at();
 
--- Profiles mirror auth.users; created by trigger on signup.
-create table public.profiles (
+create table eviction_management.profiles (
   id          uuid primary key references auth.users(id) on delete cascade,
   email       text not null,
   full_name   text,
-  org_id      uuid references public.organizations(id) on delete set null,
-  role        user_role not null default 'owner',
+  org_id      uuid references eviction_management.organizations(id) on delete set null,
+  role        eviction_management.user_role not null default 'owner',
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
-create index on public.profiles (org_id);
-create trigger trg_profiles_updated before update on public.profiles
-  for each row execute function public.touch_updated_at();
+create index on eviction_management.profiles (org_id);
+create trigger trg_profiles_updated before update on eviction_management.profiles
+  for each row execute function eviction_management.touch_updated_at();
 
--- Bootstrap profile + org on first signup.
-create or replace function public.handle_new_user() returns trigger
-language plpgsql security definer set search_path = public as $$
-declare new_org uuid;
+-- Idempotent bootstrap: call from the EMS app on first login.
+-- Returns the user's EMS org_id (creating one if needed).
+create or replace function eviction_management.ensure_profile(p_org_name text default null)
+returns uuid
+language plpgsql security definer set search_path = eviction_management, public, auth as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_email   text;
+  v_org_id  uuid;
 begin
-  insert into public.organizations (name)
-    values (coalesce(new.raw_user_meta_data->>'org_name', 'My Organization'))
-    returning id into new_org;
-  insert into public.profiles (id, email, full_name, org_id, role)
-    values (new.id, new.email,
-            new.raw_user_meta_data->>'full_name',
-            new_org, 'owner');
-  return new;
+  if v_user_id is null then
+    raise exception 'not authenticated';
+  end if;
+
+  select org_id into v_org_id from eviction_management.profiles where id = v_user_id;
+  if v_org_id is not null then return v_org_id; end if;
+
+  select email into v_email from auth.users where id = v_user_id;
+
+  insert into eviction_management.organizations (name)
+    values (coalesce(p_org_name, 'My Organization'))
+    returning id into v_org_id;
+
+  insert into eviction_management.profiles (id, email, full_name, org_id, role)
+    values (v_user_id, v_email, null, v_org_id, 'owner')
+    on conflict (id) do update
+      set org_id = excluded.org_id,
+          email  = excluded.email
+    returning org_id into v_org_id;
+
+  return v_org_id;
 end $$;
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created
-  after insert on auth.users
-  for each row execute function public.handle_new_user();
+grant execute on function eviction_management.ensure_profile(text) to authenticated;
 
--- Convenience helper: current user's org.
-create or replace function public.current_org_id() returns uuid
-language sql stable security definer set search_path = public as $$
-  select org_id from public.profiles where id = auth.uid()
+create or replace function eviction_management.current_org_id() returns uuid
+language sql stable security definer set search_path = eviction_management, auth as $$
+  select org_id from eviction_management.profiles where id = auth.uid()
 $$;
+grant execute on function eviction_management.current_org_id() to authenticated;
 
 -- =====================================================================
--- Properties / leases / tenants  (EMS-native; no PM module dependency)
+-- Properties / leases / renters
+-- (We use `renters` instead of `tenants` to avoid confusion with the
+-- platform's existing public.tenants org/SaaS-tenant table.)
 -- =====================================================================
-create table public.properties (
+create table eviction_management.properties (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
   address_line1 text not null,
   address_line2 text,
   city        text not null,
@@ -117,19 +145,19 @@ create table public.properties (
   postal_code text not null,
   county      text,
   jurisdiction_code text,
-  property_type property_type not null default 'SFR',
+  property_type eviction_management.property_type not null default 'SFR',
   rent_control_flag boolean not null default false,
   federal_funding_flag boolean not null default false,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
-create index on public.properties (org_id);
-create trigger trg_properties_updated before update on public.properties
-  for each row execute function public.touch_updated_at();
+create index on eviction_management.properties (org_id);
+create trigger trg_properties_updated before update on eviction_management.properties
+  for each row execute function eviction_management.touch_updated_at();
 
-create table public.tenants (
+create table eviction_management.renters (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
   full_name   text not null,
   email       text,
   phone       text,
@@ -138,15 +166,15 @@ create table public.tenants (
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
-create index on public.tenants (org_id);
-create trigger trg_tenants_updated before update on public.tenants
-  for each row execute function public.touch_updated_at();
+create index on eviction_management.renters (org_id);
+create trigger trg_renters_updated before update on eviction_management.renters
+  for each row execute function eviction_management.touch_updated_at();
 
-create table public.leases (
+create table eviction_management.leases (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  property_id uuid not null references public.properties(id) on delete restrict,
-  tenancy_type tenancy_type not null default 'WRITTEN_LEASE',
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  property_id uuid not null references eviction_management.properties(id) on delete restrict,
+  tenancy_type eviction_management.tenancy_type not null default 'WRITTEN_LEASE',
   start_date  date not null,
   end_date    date,
   rent_amount_cents integer not null default 0,
@@ -155,26 +183,26 @@ create table public.leases (
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
-create index on public.leases (org_id);
-create index on public.leases (property_id);
-create trigger trg_leases_updated before update on public.leases
-  for each row execute function public.touch_updated_at();
+create index on eviction_management.leases (org_id);
+create index on eviction_management.leases (property_id);
+create trigger trg_leases_updated before update on eviction_management.leases
+  for each row execute function eviction_management.touch_updated_at();
 
-create table public.lease_tenants (
-  lease_id  uuid not null references public.leases(id) on delete cascade,
-  tenant_id uuid not null references public.tenants(id) on delete cascade,
-  primary key (lease_id, tenant_id)
+create table eviction_management.lease_renters (
+  lease_id  uuid not null references eviction_management.leases(id) on delete cascade,
+  renter_id uuid not null references eviction_management.renters(id) on delete cascade,
+  primary key (lease_id, renter_id)
 );
 
 -- =====================================================================
 -- Cases
 -- =====================================================================
-create table public.cases (
+create table eviction_management.cases (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  lease_id    uuid not null references public.leases(id) on delete restrict,
-  status      case_status not null default 'DRAFT',
-  grounds     grounds not null,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  lease_id    uuid not null references eviction_management.leases(id) on delete restrict,
+  status      eviction_management.case_status not null default 'DRAFT',
+  grounds     eviction_management.grounds not null,
   jurisdiction_code text not null,
   opened_at   timestamptz not null default now(),
   resolved_at timestamptz,
@@ -184,41 +212,40 @@ create table public.cases (
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
-create index on public.cases (org_id, status);
-create index on public.cases (lease_id);
-create trigger trg_cases_updated before update on public.cases
-  for each row execute function public.touch_updated_at();
+create index on eviction_management.cases (org_id, status);
+create index on eviction_management.cases (lease_id);
+create trigger trg_cases_updated before update on eviction_management.cases
+  for each row execute function eviction_management.touch_updated_at();
 
-create table public.case_events (
+create table eviction_management.case_events (
   id          uuid primary key default gen_random_uuid(),
-  case_id     uuid not null references public.cases(id) on delete cascade,
+  case_id     uuid not null references eviction_management.cases(id) on delete cascade,
   type        text not null,
-  actor_type  case_event_actor not null,
+  actor_type  eviction_management.case_event_actor not null,
   actor_id    uuid,
   payload     jsonb not null default '{}'::jsonb,
-  prev_state  case_status,
-  next_state  case_status,
+  prev_state  eviction_management.case_status,
+  next_state  eviction_management.case_status,
   created_at  timestamptz not null default now()
 );
-create index on public.case_events (case_id, created_at desc);
+create index on eviction_management.case_events (case_id, created_at desc);
 
--- Append-only enforcement for case_events.
-create or replace function public.case_events_no_mutate() returns trigger
+create or replace function eviction_management.case_events_no_mutate() returns trigger
 language plpgsql as $$
-begin raise exception 'case_events is append-only'; end $$;
+begin raise exception 'eviction_management.case_events is append-only'; end $$;
 create trigger case_events_no_update
-  before update or delete on public.case_events
-  for each row execute function public.case_events_no_mutate();
+  before update or delete on eviction_management.case_events
+  for each row execute function eviction_management.case_events_no_mutate();
 
 -- =====================================================================
 -- Jurisdictional rules
 -- =====================================================================
-create table public.jurisdiction_rules (
+create table eviction_management.jurisdiction_rules (
   id              uuid primary key default gen_random_uuid(),
   jurisdiction_code text not null,
-  rule_type       rule_type not null,
-  grounds         grounds[] not null default '{}',
-  tenancy_types   tenancy_type[] not null default '{}',
+  rule_type       eviction_management.rule_type not null,
+  grounds         eviction_management.grounds[] not null default '{}',
+  tenancy_types   eviction_management.tenancy_type[] not null default '{}',
   payload         jsonb not null,
   statute_citation text,
   effective_from  date not null default current_date,
@@ -228,15 +255,15 @@ create table public.jurisdiction_rules (
   verified_at     timestamptz,
   created_at      timestamptz not null default now()
 );
-create index on public.jurisdiction_rules (jurisdiction_code, rule_type, effective_from desc);
+create index on eviction_management.jurisdiction_rules (jurisdiction_code, rule_type, effective_from desc);
 
 -- =====================================================================
 -- Templates / documents / notices / filings / hearings
 -- =====================================================================
-create table public.form_templates (
+create table eviction_management.form_templates (
   id          uuid primary key default gen_random_uuid(),
   jurisdiction_code text not null,
-  type        document_type not null,
+  type        eviction_management.document_type not null,
   version     text not null,
   fields_schema jsonb not null default '{}'::jsonb,
   body        text not null,
@@ -247,48 +274,48 @@ create table public.form_templates (
   unique (jurisdiction_code, type, version)
 );
 
-create table public.documents (
+create table eviction_management.documents (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  case_id     uuid references public.cases(id) on delete cascade,
-  type        document_type not null,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  case_id     uuid references eviction_management.cases(id) on delete cascade,
+  type        eviction_management.document_type not null,
   storage_key text,
   hash_sha256 text,
   signed_by   jsonb not null default '[]'::jsonb,
-  generated_from_template uuid references public.form_templates(id),
+  generated_from_template uuid references eviction_management.form_templates(id),
   created_at  timestamptz not null default now()
 );
-create index on public.documents (case_id);
+create index on eviction_management.documents (case_id);
 
-create table public.notices (
+create table eviction_management.notices (
   id          uuid primary key default gen_random_uuid(),
-  case_id     uuid not null references public.cases(id) on delete cascade,
+  case_id     uuid not null references eviction_management.cases(id) on delete cascade,
   type        text not null,
   served_at   timestamptz,
-  service_method service_method,
+  service_method eviction_management.service_method,
   served_by   uuid,
-  evidence_doc_id uuid references public.documents(id),
+  evidence_doc_id uuid references eviction_management.documents(id),
   computed_expires_at timestamptz,
   created_at  timestamptz not null default now()
 );
-create index on public.notices (case_id);
+create index on eviction_management.notices (case_id);
 
-create table public.filings (
+create table eviction_management.filings (
   id          uuid primary key default gen_random_uuid(),
-  case_id     uuid not null references public.cases(id) on delete cascade,
+  case_id     uuid not null references eviction_management.cases(id) on delete cascade,
   court_name  text,
   filed_at    timestamptz,
   external_filing_id text,
   status      text,
   fee_cents   integer,
-  document_id uuid references public.documents(id),
+  document_id uuid references eviction_management.documents(id),
   created_at  timestamptz not null default now()
 );
-create index on public.filings (case_id);
+create index on eviction_management.filings (case_id);
 
-create table public.hearings (
+create table eviction_management.hearings (
   id          uuid primary key default gen_random_uuid(),
-  case_id     uuid not null references public.cases(id) on delete cascade,
+  case_id     uuid not null references eviction_management.cases(id) on delete cascade,
   court_name  text,
   scheduled_at timestamptz,
   type        text,
@@ -296,27 +323,27 @@ create table public.hearings (
   notes       text,
   created_at  timestamptz not null default now()
 );
-create index on public.hearings (case_id);
+create index on eviction_management.hearings (case_id);
 
 -- =====================================================================
 -- Ledger / payments
 -- =====================================================================
-create table public.ledger_entries (
+create table eviction_management.ledger_entries (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  lease_id    uuid not null references public.leases(id) on delete cascade,
-  case_id     uuid references public.cases(id) on delete set null,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  lease_id    uuid not null references eviction_management.leases(id) on delete cascade,
+  case_id     uuid references eviction_management.cases(id) on delete set null,
   posted_at   timestamptz not null default now(),
   debit_cents integer not null default 0,
   credit_cents integer not null default 0,
   memo        text
 );
-create index on public.ledger_entries (lease_id, posted_at desc);
+create index on eviction_management.ledger_entries (lease_id, posted_at desc);
 
-create table public.payments (
+create table eviction_management.payments (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  case_id     uuid references public.cases(id) on delete set null,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  case_id     uuid references eviction_management.cases(id) on delete set null,
   amount_cents integer not null,
   type        text not null,
   source      text,
@@ -324,15 +351,15 @@ create table public.payments (
   status      text not null default 'pending',
   created_at  timestamptz not null default now()
 );
-create index on public.payments (case_id);
+create index on eviction_management.payments (case_id);
 
 -- =====================================================================
 -- Evidence / communications / tasks
 -- =====================================================================
-create table public.evidence (
+create table eviction_management.evidence (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  case_id     uuid not null references public.cases(id) on delete cascade,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  case_id     uuid not null references eviction_management.cases(id) on delete cascade,
   type        text not null,
   captured_at timestamptz,
   geotag      jsonb,
@@ -341,40 +368,40 @@ create table public.evidence (
   description text,
   created_at  timestamptz not null default now()
 );
-create index on public.evidence (case_id);
+create index on eviction_management.evidence (case_id);
 
-create table public.communications (
+create table eviction_management.communications (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  case_id     uuid not null references public.cases(id) on delete cascade,
-  channel     comm_channel not null,
-  direction   comm_direction not null,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  case_id     uuid not null references eviction_management.cases(id) on delete cascade,
+  channel     eviction_management.comm_channel not null,
+  direction   eviction_management.comm_direction not null,
   subject     text,
   body        text,
   attachments jsonb not null default '[]'::jsonb,
   delivered_at timestamptz,
   created_at  timestamptz not null default now()
 );
-create index on public.communications (case_id, created_at desc);
+create index on eviction_management.communications (case_id, created_at desc);
 
-create table public.tasks (
+create table eviction_management.tasks (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  case_id     uuid references public.cases(id) on delete cascade,
-  assignee_id uuid references public.profiles(id) on delete set null,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  case_id     uuid references eviction_management.cases(id) on delete cascade,
+  assignee_id uuid references eviction_management.profiles(id) on delete set null,
   type        text not null,
   title       text not null,
   due_at      timestamptz,
   status      text not null default 'open',
-  blocking_state case_status,
+  blocking_state eviction_management.case_status,
   created_at  timestamptz not null default now()
 );
-create index on public.tasks (assignee_id, status, due_at);
+create index on eviction_management.tasks (assignee_id, status, due_at);
 
 -- =====================================================================
 -- Attorneys / engagements
 -- =====================================================================
-create table public.attorneys (
+create table eviction_management.attorneys (
   id          uuid primary key default gen_random_uuid(),
   full_name   text not null,
   email       text,
@@ -387,11 +414,11 @@ create table public.attorneys (
   created_at  timestamptz not null default now()
 );
 
-create table public.engagements (
+create table eviction_management.engagements (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references public.organizations(id) on delete cascade,
-  case_id     uuid not null references public.cases(id) on delete cascade,
-  attorney_id uuid not null references public.attorneys(id) on delete restrict,
+  org_id      uuid not null references eviction_management.organizations(id) on delete cascade,
+  case_id     uuid not null references eviction_management.cases(id) on delete cascade,
+  attorney_id uuid not null references eviction_management.attorneys(id) on delete restrict,
   scope       text not null,
   fee_arrangement jsonb not null default '{}'::jsonb,
   status      text not null default 'pending',
@@ -401,116 +428,139 @@ create table public.engagements (
 -- =====================================================================
 -- Row-Level Security
 -- =====================================================================
-alter table public.organizations    enable row level security;
-alter table public.profiles         enable row level security;
-alter table public.properties       enable row level security;
-alter table public.tenants          enable row level security;
-alter table public.leases           enable row level security;
-alter table public.lease_tenants    enable row level security;
-alter table public.cases            enable row level security;
-alter table public.case_events      enable row level security;
-alter table public.documents        enable row level security;
-alter table public.notices          enable row level security;
-alter table public.filings          enable row level security;
-alter table public.hearings         enable row level security;
-alter table public.ledger_entries   enable row level security;
-alter table public.payments         enable row level security;
-alter table public.evidence         enable row level security;
-alter table public.communications   enable row level security;
-alter table public.tasks            enable row level security;
-alter table public.engagements      enable row level security;
+alter table eviction_management.organizations    enable row level security;
+alter table eviction_management.profiles         enable row level security;
+alter table eviction_management.properties       enable row level security;
+alter table eviction_management.renters          enable row level security;
+alter table eviction_management.leases           enable row level security;
+alter table eviction_management.lease_renters    enable row level security;
+alter table eviction_management.cases            enable row level security;
+alter table eviction_management.case_events      enable row level security;
+alter table eviction_management.documents        enable row level security;
+alter table eviction_management.notices          enable row level security;
+alter table eviction_management.filings          enable row level security;
+alter table eviction_management.hearings         enable row level security;
+alter table eviction_management.ledger_entries   enable row level security;
+alter table eviction_management.payments         enable row level security;
+alter table eviction_management.evidence         enable row level security;
+alter table eviction_management.communications   enable row level security;
+alter table eviction_management.tasks            enable row level security;
+alter table eviction_management.engagements      enable row level security;
+alter table eviction_management.jurisdiction_rules enable row level security;
+alter table eviction_management.form_templates     enable row level security;
+alter table eviction_management.attorneys          enable row level security;
 
--- Public-read tables (rules, templates, attorney directory).
-alter table public.jurisdiction_rules enable row level security;
-alter table public.form_templates     enable row level security;
-alter table public.attorneys          enable row level security;
 create policy "rules readable by all authenticated"
-  on public.jurisdiction_rules for select to authenticated using (true);
+  on eviction_management.jurisdiction_rules for select to authenticated using (true);
 create policy "templates readable by all authenticated"
-  on public.form_templates for select to authenticated using (true);
+  on eviction_management.form_templates for select to authenticated using (true);
 create policy "attorneys readable by all authenticated"
-  on public.attorneys for select to authenticated using (active);
+  on eviction_management.attorneys for select to authenticated using (active);
 
--- Org-scoped policies.
-create policy "own org" on public.organizations
-  for select using (id = public.current_org_id());
+create policy "own org" on eviction_management.organizations
+  for select using (id = eviction_management.current_org_id());
 
-create policy "own profile read"  on public.profiles
-  for select using (id = auth.uid() or org_id = public.current_org_id());
-create policy "own profile update" on public.profiles
+create policy "own profile read"  on eviction_management.profiles
+  for select using (id = auth.uid() or org_id = eviction_management.current_org_id());
+create policy "own profile update" on eviction_management.profiles
   for update using (id = auth.uid()) with check (id = auth.uid());
 
--- Macro: same shape applied to every org-scoped table.
 do $$
 declare t text;
 begin
   for t in select unnest(array[
-    'properties','tenants','leases','cases','documents','evidence',
+    'properties','renters','leases','cases','documents','evidence',
     'communications','tasks','engagements','ledger_entries','payments'
   ]) loop
     execute format($f$
-      create policy "%I_select" on public.%I
-        for select using (org_id = public.current_org_id());
-      create policy "%I_insert" on public.%I
-        for insert with check (org_id = public.current_org_id());
-      create policy "%I_update" on public.%I
-        for update using (org_id = public.current_org_id())
-        with check (org_id = public.current_org_id());
-      create policy "%I_delete" on public.%I
-        for delete using (org_id = public.current_org_id());
+      create policy "%I_select" on eviction_management.%I
+        for select using (org_id = eviction_management.current_org_id());
+      create policy "%I_insert" on eviction_management.%I
+        for insert with check (org_id = eviction_management.current_org_id());
+      create policy "%I_update" on eviction_management.%I
+        for update using (org_id = eviction_management.current_org_id())
+        with check (org_id = eviction_management.current_org_id());
+      create policy "%I_delete" on eviction_management.%I
+        for delete using (org_id = eviction_management.current_org_id());
     $f$, t, t, t, t, t, t, t, t);
   end loop;
 end $$;
 
--- Children scoped via parent.
-create policy "lease_tenants_via_lease" on public.lease_tenants
+create policy "lease_renters_via_lease" on eviction_management.lease_renters
   for all using (
-    exists (select 1 from public.leases l
-            where l.id = lease_id and l.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.leases l
+            where l.id = lease_id and l.org_id = eviction_management.current_org_id())
   ) with check (
-    exists (select 1 from public.leases l
-            where l.id = lease_id and l.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.leases l
+            where l.id = lease_id and l.org_id = eviction_management.current_org_id())
   );
 
-create policy "case_events_select" on public.case_events
+create policy "case_events_select" on eviction_management.case_events
   for select using (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   );
-create policy "case_events_insert" on public.case_events
+create policy "case_events_insert" on eviction_management.case_events
   for insert with check (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   );
 
-create policy "notices_via_case_select" on public.notices
-  for select using (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
-  );
-create policy "notices_via_case_write" on public.notices
+create policy "notices_via_case" on eviction_management.notices
   for all using (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   ) with check (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   );
 
-create policy "filings_via_case" on public.filings
+create policy "filings_via_case" on eviction_management.filings
   for all using (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   ) with check (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   );
 
-create policy "hearings_via_case" on public.hearings
+create policy "hearings_via_case" on eviction_management.hearings
   for all using (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   ) with check (
-    exists (select 1 from public.cases c
-            where c.id = case_id and c.org_id = public.current_org_id())
+    exists (select 1 from eviction_management.cases c
+            where c.id = case_id and c.org_id = eviction_management.current_org_id())
   );
+
+-- =====================================================================
+-- Identity labels: every EMS object is tagged so it is unmistakably
+-- part of the Eviction Management module in any DB browsing tool.
+-- =====================================================================
+comment on schema eviction_management is
+  'Eviction Management module (EMS) — standalone product. All tables, types, functions, and policies in this schema belong to the eviction-management application and are isolated from HOA, Property Management, and other modules.';
+
+do $tag$
+declare obj record;
+begin
+  for obj in
+    select c.relname as name,
+           case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' end as kind
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'eviction_management' and c.relkind in ('r','v','m')
+  loop
+    execute format('comment on %s eviction_management.%I is %L',
+                   obj.kind, obj.name,
+                   'EMS (Eviction Management) — ' || obj.name);
+  end loop;
+end $tag$;
+
+comment on function eviction_management.ensure_profile(text) is
+  'EMS (Eviction Management) — idempotently bootstraps an org + profile for the current user.';
+comment on function eviction_management.current_org_id() is
+  'EMS (Eviction Management) — returns the current user''s EMS org_id for RLS policies.';
+comment on function eviction_management.touch_updated_at() is
+  'EMS (Eviction Management) — generic updated_at trigger.';
+comment on function eviction_management.case_events_no_mutate() is
+  'EMS (Eviction Management) — enforces append-only case_events table.';
