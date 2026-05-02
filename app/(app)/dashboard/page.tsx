@@ -7,7 +7,12 @@ export default async function DashboardPage() {
   const supabase = await createClient();
   const { data: cases } = await supabase
     .from("cases")
-    .select("id, status, grounds, jurisdiction_code, opened_at")
+    .select(`
+      id, status, grounds, jurisdiction_code, opened_at,
+      lease:leases (
+        property:properties ( address_line1, city, state )
+      )
+    `)
     .order("opened_at", { ascending: false })
     .limit(50);
 
@@ -23,19 +28,25 @@ export default async function DashboardPage() {
 
       {cases && cases.length > 0 ? (
         <div className="grid gap-3">
-          {cases.map((c) => (
-            <Card key={c.id}>
-              <CardContent className="flex items-center justify-between p-4">
-                <div>
-                  <p className="font-medium">{c.grounds.replace(/_/g, " ")}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {c.jurisdiction_code} · opened {new Date(c.opened_at).toLocaleDateString()}
-                  </p>
-                </div>
-                <span className="rounded-md border px-2 py-1 text-xs">{c.status}</span>
-              </CardContent>
-            </Card>
-          ))}
+          {cases.map((c) => {
+            const lease = Array.isArray(c.lease) ? c.lease[0] : c.lease;
+            const property = lease ? (Array.isArray(lease.property) ? lease.property[0] : lease.property) : null;
+            return (
+              <Link key={c.id} href={`/cases/${c.id}`}>
+                <Card className="transition hover:bg-accent">
+                  <CardContent className="flex items-center justify-between p-4">
+                    <div>
+                      <p className="font-medium">{property?.address_line1 ?? "Property"}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {property?.city}, {property?.state} · {c.grounds.replace(/_/g, " ")} · opened {new Date(c.opened_at).toLocaleDateString()}
+                      </p>
+                    </div>
+                    <span className="rounded-md border px-2 py-1 text-xs">{c.status.replace(/_/g, " ")}</span>
+                  </CardContent>
+                </Card>
+              </Link>
+            );
+          })}
         </div>
       ) : (
         <Card>
