@@ -34,8 +34,13 @@ export async function updateSession(request: NextRequest) {
   const isProtected =
     path.startsWith("/dashboard") ||
     path.startsWith("/cases") ||
+    path.startsWith("/properties") ||
+    path.startsWith("/renters") ||
+    path.startsWith("/leases") ||
+    path.startsWith("/attorneys") ||
     path.startsWith("/settings") ||
     path.startsWith("/admin");
+  // /portal/[token] is intentionally public; auth via opaque token.
 
   if (!user && isProtected) {
     const url = request.nextUrl.clone();

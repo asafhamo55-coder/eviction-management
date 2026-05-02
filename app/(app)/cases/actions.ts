@@ -104,6 +104,54 @@ export async function createCase(formData: FormData) {
   redirect(`/cases/${caseRow.id}`);
 }
 
+const markFiledSchema = z.object({
+  case_id: z.string().uuid(),
+  filed_at: z.string().min(1),
+  external_filing_id: z.string().optional().nullable(),
+});
+
+export async function markFiled(formData: FormData) {
+  const parsed = markFiledSchema.parse({
+    case_id: formData.get("case_id"),
+    filed_at: formData.get("filed_at"),
+    external_filing_id: formData.get("external_filing_id") || null,
+  });
+
+  const supabase = await createClient();
+
+  const { data: caseRow, error: caseErr } = await supabase
+    .from("cases")
+    .select("id, status, computed")
+    .eq("id", parsed.case_id)
+    .single();
+  if (caseErr || !caseRow) throw new Error(caseErr?.message ?? "Case not found");
+
+  const computed = (caseRow.computed ?? {}) as { rules?: { courtVenue?: { court_name?: string }; fee?: { fee_cents?: number } } };
+
+  await supabase.from("filings").insert({
+    case_id: parsed.case_id,
+    court_name: computed.rules?.courtVenue?.court_name ?? null,
+    filed_at: parsed.filed_at,
+    external_filing_id: parsed.external_filing_id,
+    status: "FILED",
+    fee_cents: computed.rules?.fee?.fee_cents ?? null,
+  });
+
+  await supabase.from("cases").update({ status: "FILED" }).eq("id", parsed.case_id);
+
+  await supabase.from("case_events").insert({
+    case_id: parsed.case_id,
+    type: "FILED",
+    actor_type: "LANDLORD",
+    payload: { filed_at: parsed.filed_at, external_filing_id: parsed.external_filing_id },
+    prev_state: caseRow.status,
+    next_state: "FILED",
+  });
+
+  revalidatePath(`/cases/${parsed.case_id}`);
+  redirect(`/cases/${parsed.case_id}`);
+}
+
 const markServedSchema = z.object({
   case_id: z.string().uuid(),
   service_method: z.enum(["PERSONAL", "POST_AND_MAIL", "CERTIFIED_MAIL"]),

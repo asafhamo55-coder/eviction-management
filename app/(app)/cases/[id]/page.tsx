@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { NextActions } from "@/components/next-actions";
 import { markNoticeServed } from "../actions";
 
 export default async function CaseDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -14,7 +15,7 @@ export default async function CaseDetailPage({ params }: { params: Promise<{ id:
   const { data: caseRow } = await supabase
     .from("cases")
     .select(`
-      id, status, grounds, jurisdiction_code, opened_at, flags, computed,
+      id, status, grounds, jurisdiction_code, opened_at, flags, computed, tenant_portal_token, attorney_id,
       lease:leases (
         rent_amount_cents, tenancy_type,
         property:properties ( address_line1, city, state, postal_code, jurisdiction_code )
@@ -36,6 +37,24 @@ export default async function CaseDetailPage({ params }: { params: Promise<{ id:
     .eq("case_id", id)
     .order("created_at", { ascending: false });
 
+  const { data: filings } = await supabase
+    .from("filings")
+    .select("id, court_name, filed_at, status")
+    .eq("case_id", id)
+    .order("created_at", { ascending: false });
+
+  const { data: engagements } = await supabase
+    .from("engagements")
+    .select(`
+      id, scope, status, fee_arrangement,
+      attorney:attorneys ( id, full_name, bar_id )
+    `)
+    .eq("case_id", id)
+    .order("created_at", { ascending: false });
+
+  const cureExpiresAt =
+    notices?.find((n) => n.computed_expires_at)?.computed_expires_at ?? null;
+
   const lease = Array.isArray(caseRow.lease) ? caseRow.lease[0] : caseRow.lease;
   const property = lease ? (Array.isArray(lease.property) ? lease.property[0] : lease.property) : null;
   const computed = (caseRow.computed ?? {}) as {
@@ -51,6 +70,13 @@ export default async function CaseDetailPage({ params }: { params: Promise<{ id:
         <h1 className="text-2xl font-semibold tracking-tight">{property?.address_line1}</h1>
         <p className="text-sm text-muted-foreground">{property?.city}, {property?.state} {property?.postal_code}</p>
       </div>
+
+      <NextActions
+        status={caseRow.status}
+        caseId={id}
+        cureExpiresAt={cureExpiresAt}
+        hasFiling={!!(filings && filings.length > 0)}
+      />
 
       <div className="grid gap-4 md:grid-cols-3">
         <Card>
@@ -121,6 +147,80 @@ export default async function CaseDetailPage({ params }: { params: Promise<{ id:
               <Button type="submit" size="sm" variant="outline">Mark notice served</Button>
             </form>
           ) : null}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Tenant portal</CardTitle>
+          <CardDescription>Share this link with the renter so they can pay, propose a plan, or acknowledge.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <code className="block break-all rounded-md border bg-muted p-2 text-xs">
+            /portal/{caseRow.tenant_portal_token}
+          </code>
+          <Button asChild size="sm" variant="outline">
+            <a href={`/portal/${caseRow.tenant_portal_token}`} target="_blank" rel="noreferrer">Preview tenant view</a>
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Filings</CardTitle>
+          <CardDescription>{filings && filings.length > 0 ? "Court filings on this case." : "No filings yet."}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {filings && filings.length > 0 ? (
+            filings.map((f) => (
+              <div key={f.id} className="rounded-md border p-3 text-sm">
+                <p className="font-medium">{f.court_name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {f.filed_at ? `Filed ${new Date(f.filed_at).toLocaleDateString()}` : "Drafted, not yet filed"}
+                  {f.status ? ` · ${f.status}` : ""}
+                </p>
+              </div>
+            ))
+          ) : null}
+          <div className="flex gap-2">
+            <Button asChild size="sm" variant="outline">
+              <Link href={`/cases/${id}/file`}>{filings && filings.length > 0 ? "Open complaint draft" : "Draft complaint"}</Link>
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Attorney engagement</CardTitle>
+          <CardDescription>
+            {engagements && engagements.length > 0
+              ? "An attorney is engaged on this case."
+              : "Engage a licensed attorney for limited-scope or full representation."}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {engagements && engagements.length > 0 ? (
+            engagements.map((e) => {
+              const a = Array.isArray(e.attorney) ? e.attorney[0] : e.attorney;
+              return (
+                <div key={e.id} className="rounded-md border p-3 text-sm">
+                  <p className="font-medium">{a?.full_name} {a?.bar_id ? <span className="text-xs text-muted-foreground">· Bar {a.bar_id}</span> : null}</p>
+                  <p className="text-xs text-muted-foreground">{e.scope} · {e.status}</p>
+                </div>
+              );
+            })
+          ) : null}
+          <div className="flex flex-wrap gap-2">
+            <Button asChild size="sm" variant="outline">
+              <Link href={`/attorneys?caseId=${id}`}>Browse attorneys</Link>
+            </Button>
+            {engagements && engagements.length > 0 ? (
+              <Button asChild size="sm" variant="outline">
+                <a href={`/cases/${id}/engagement.pdf`} target="_blank" rel="noreferrer">Engagement letter PDF</a>
+              </Button>
+            ) : null}
+          </div>
         </CardContent>
       </Card>
 

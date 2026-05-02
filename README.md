@@ -63,17 +63,17 @@ supabase/
 ## Build milestones
 
 - [x] **0** — Foundation: scaffold, schema, auth, GA/Fulton seed, dashboard shell
-- [ ] **1** — Property/Lease/Tenant CRUD
-- [ ] **2** — Intake wizard + jurisdiction resolver
-- [ ] **3** — Notice composer + react-pdf render + Lob test-mode mail
-- [ ] **4** — Case Console (status, next actions, timeline)
-- [ ] **5** — Tenant portal (notice display + Stripe cure payment)
+- [x] **1** — Property / Renter / Lease CRUD
+- [x] **2** — Intake wizard + Demand for Possession PDF + mark-served + cure-expiry
+- [x] **3a** — Tenant portal (public token URL, record payment, plan/dispute/vacate intents)
+- [x] **3b** — Filing composer (Dispossessory Affidavit PDF, mark-filed)
+- [x] **3c** — Attorney marketplace + engagement flow + engagement letter PDF
+- [x] **3d** — Case Console next-actions + cure-expiry countdown
+- [ ] **4** — Hearing / judgment / writ flow
+- [ ] **5** — Stripe payments (live tenant cure + per-case billing + Pro subscription)
 - [ ] **6** — Evidence vault
-- [ ] **7** — Filing composer (manual upload, then Tyler API)
-- [ ] **8** — Hearing / judgment / writ flow
-- [ ] **9** — Attorney marketplace v1 (manual onboarding)
-- [ ] **10** — Billing (Stripe: per-case + Pro subscription)
-- [ ] **11** — AI assist (Groq, opt-in)
+- [ ] **7** — E-filing API (Tyler Odyssey for Magistrate Court)
+- [ ] **8** — AI assist (Groq, opt-in)
 
 ## Standalone posture
 
